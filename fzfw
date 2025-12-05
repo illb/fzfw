@@ -1,0 +1,188 @@
+#!/bin/bash
+
+# fzfw - Reusable directory and file selector (fzf wrapper)
+# Usage: fzfw [-d max_depth] [-f] [-v] [search_path]
+# -d: Max depth for search (default: 4)
+# -f: Include files in selection (default: directories only)
+# -v: Verbose mode (show informational messages)
+# If no search_path is provided, uses current directory as default
+# Default max_depth is 4
+
+# --- Configuration ---
+EXCLUDE_DIRS=(".git" "node_modules" "__pycache__" ".venv" "bin" "build" "target" "dist" "out" ".gradle" ".idea" ".vscode" "coverage" ".nyc_output" "logs" "tmp" "temp" ".DS_Store" "*.egg-info" ".pytest_cache" ".kotlin")
+DEFAULT_MAX_DEPTH=4
+# --- End of Configuration ---
+
+# Check required commands
+if ! command -v fd >/dev/null 2>&1; then
+    echo "Error: fd command is required but not found. Please install fd." >&2
+    exit 1
+fi
+
+if ! command -v fzf >/dev/null 2>&1; then
+    echo "Error: fzf command is required but not found. Please install fzf." >&2
+    exit 1
+fi
+
+# Parse arguments
+MAX_DEPTH="$DEFAULT_MAX_DEPTH"
+SEARCH_PATH=""
+INCLUDE_FILES=false
+VERBOSE=false
+
+while getopts "d:fv" opt; do
+    case $opt in
+        d)
+            MAX_DEPTH="$OPTARG"
+            ;;
+        f)
+            INCLUDE_FILES=true
+            ;;
+        v)
+            VERBOSE=true
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            exit 1
+            ;;
+    esac
+done
+
+shift $((OPTIND-1))
+SEARCH_PATH="$1"
+
+# Function to convert relative path to absolute path
+to_absolute_path() {
+    local selected_path="$1"
+    local base_path="$2"
+    
+    if [ -z "$selected_path" ]; then
+        return
+    fi
+    
+    if [ "${selected_path#/}" = "$selected_path" ]; then
+        # Relative path, convert to absolute
+        echo "$base_path/$selected_path"
+    else
+        # Already absolute path, but normalize it
+        if command -v realpath >/dev/null 2>&1; then
+            realpath "$selected_path" 2>/dev/null || echo "$selected_path"
+        else
+            echo "$selected_path"
+        fi
+    fi
+}
+
+# Function to select initial directory from home directory (without preview)
+select_initial_directory() {
+    local search_path="$1"
+    local max_depth="$2"
+    
+    # Get absolute path
+    local abs_search_path
+    abs_search_path=$(cd "$search_path" && pwd)
+    
+    # Simple directory search
+    local selected_path=""
+    selected_path=$(cd "$search_path" && fd -t d -d "$max_depth" | fzf --prompt "Select Initial Directory > ")
+    
+    # Convert relative path to absolute path
+    to_absolute_path "$selected_path" "$abs_search_path"
+}
+
+# Function to search in directory with preview (for second search step)
+search_in_directory() {
+    local search_path="$1"
+    local max_depth="$2"
+    local include_files="$3"
+    
+    # Get absolute path
+    local abs_search_path
+    abs_search_path=$(cd "$search_path" && pwd)
+    
+    # Build preview command
+    # For directories: show directory contents
+    # For files: show file preview (first 50 lines)
+    local preview_cmd=""
+    if [ "$include_files" = true ]; then
+        # Check if bat is available for syntax highlighting
+        if command -v bat >/dev/null 2>&1; then
+            preview_cmd='cd "'"$abs_search_path"'" && item_path=$(echo {} | tr -d "'\''") && item=$(realpath -m "$item_path" 2>/dev/null || echo "'"$abs_search_path"'/$item_path"); if [ -d "$item" ]; then 
+                if command -v tree >/dev/null 2>&1; then 
+                    tree -L 2 -a "$item" 2>/dev/null || ls -lah "$item" 
+                else 
+                    ls -lah "$item" 
+                fi
+            else 
+                bat --color=always --style=header,grid --line-range :50 "$item" 2>/dev/null || head -50 "$item" 
+            fi'
+        else
+            preview_cmd='cd "'"$abs_search_path"'" && item_path=$(echo {} | tr -d "'\''") && item=$(realpath -m "$item_path" 2>/dev/null || echo "'"$abs_search_path"'/$item_path"); if [ -d "$item" ]; then 
+                if command -v tree >/dev/null 2>&1; then 
+                    tree -L 2 -a "$item" 2>/dev/null || ls -lah "$item" 
+                else 
+                    ls -lah "$item" 
+                fi
+            else 
+                head -50 "$item" 
+            fi'
+        fi
+    else
+        # Directories only
+        if command -v tree >/dev/null 2>&1; then
+            preview_cmd='cd "'"$abs_search_path"'" && item_path=$(echo {} | tr -d "'\''") && item=$(realpath -m "$item_path" 2>/dev/null || echo "'"$abs_search_path"'/$item_path"); tree -L 2 -a "$item" 2>/dev/null || ls -lah "$item"'
+        else
+            preview_cmd='cd "'"$abs_search_path"'" && item_path=$(echo {} | tr -d "'\''") && item=$(realpath -m "$item_path" 2>/dev/null || echo "'"$abs_search_path"'/$item_path"); ls -lah "$item"'
+        fi
+    fi
+    
+    # Build exclude arguments for fd
+    fd_exclude_args=()
+    for dir in "${EXCLUDE_DIRS[@]}"; do
+        fd_exclude_args+=(--exclude "$dir")
+    done
+    
+    local selected_path=""
+    if [ "$include_files" = true ]; then
+        selected_path=$(cd "$search_path" && fd --no-ignore-vcs -d "$max_depth" "${fd_exclude_args[@]}" | \
+            fzf --preview "$preview_cmd" --preview-window=right:50%:wrap:border-left)
+    else
+        selected_path=$(cd "$search_path" && fd --no-ignore-vcs -t d -d "$max_depth" "${fd_exclude_args[@]}" | \
+            fzf --preview "$preview_cmd" --preview-window=right:50%:wrap:border-left)
+    fi
+    
+    # Convert relative path to absolute path
+    to_absolute_path "$selected_path" "$abs_search_path"
+}
+
+# Determine search path: use provided path or current directory
+if [ -z "$SEARCH_PATH" ]; then
+    SEARCH_PATH="."
+    [ "$VERBOSE" = true ] && echo "No directory provided. Using current directory: $(pwd)" >&2
+else
+    # Validate provided search path exists
+    if [ ! -d "$SEARCH_PATH" ] && [ ! -f "$SEARCH_PATH" ]; then
+        echo "Error: Search path does not exist: $SEARCH_PATH" >&2
+        exit 1
+    fi
+    
+    if [ "$VERBOSE" = true ]; then
+        if [ "$INCLUDE_FILES" = true ]; then
+            echo "Searching for files and directories in $SEARCH_PATH with max depth $MAX_DEPTH..." >&2
+        else
+            echo "Searching for directories in $SEARCH_PATH with max depth $MAX_DEPTH..." >&2
+        fi
+    fi
+fi
+
+# Search in the determined directory
+TARGET_ITEM=$(search_in_directory "$SEARCH_PATH" "$MAX_DEPTH" "$INCLUDE_FILES")
+
+# Output the selected item
+if [ -n "$TARGET_ITEM" ] && ([ -d "$TARGET_ITEM" ] || [ -f "$TARGET_ITEM" ]); then
+    echo "$TARGET_ITEM"
+    exit 0
+else
+    echo "No item selected or item does not exist." >&2
+    exit 1
+fi
